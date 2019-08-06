@@ -252,6 +252,11 @@ static uint64_t sub_amount_token = 0;
 static void
 tx_timer_cb(__attribute__((unused)) struct rte_timer *tmpTime, __attribute__((unused)) void *arg)
 {
+	double upper_limit_speed = limit_speed * 1.2;
+
+	if (amount_token >= (uint64_t)upper_limit_speed)
+		return;
+
 	if (limit_speed >= 1000000)
 		amount_token += (limit_speed / 1000000);
 	else {
@@ -578,7 +583,11 @@ demu_parse_speed(const char *arg)
 		return -1;
 	}
 
-	return speed * base;
+	speed = speed * base;
+	if (speed < 1000 && 10000000000 < speed)
+		return -1;
+
+	return speed;
 }
 
 /* Parse the argument given in the command line of the application */
