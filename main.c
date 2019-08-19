@@ -2,7 +2,7 @@
  *   BSD LICENSE
  *
  *   Copyright(c) 2010-2016 Intel Corporation. All rights reserved.
- *   Copyright(c) 2016-2019 National Institute of Advanced Industrial 
+ *   Copyright(c) 2016-2019 National Institute of Advanced Industrial
  *                Science and Technology. All rights reserved.
  *
  *   Redistribution and use in source and binary forms, with or without
@@ -79,6 +79,7 @@
 #include <rte_mbuf.h>
 #include <rte_errno.h>
 #include <rte_timer.h>
+#include <rte_string_fns.h>
 
 static int64_t loss_random(const char *loss_rate);
 static int64_t loss_random_a(double loss_rate);
@@ -121,18 +122,6 @@ struct demu_port_statistics {
 struct demu_port_statistics port_statistics[RTE_MAX_ETHPORTS];
 
 /*
- * Assigment of each thread to a specific CPU core.
- * Currently, each of two threads is running for rx, tx, worker threads.
- */
-#define RX_THREAD_CORE 2
-#define RX_THREAD_CORE2 3
-#define TX_THREAD_CORE 4
-#define TX_THREAD_CORE2 5
-#define WORKER_THREAD_CORE 6
-#define WORKER_THREAD_CORE2 7
-#define TIMER_THREAD_CORE 8
-
-/*
  * The maximum number of packets which are processed in burst.
  * Note: do not set PKT_BURST_RX to 1.
  */
@@ -156,12 +145,26 @@ struct demu_port_statistics port_statistics[RTE_MAX_ETHPORTS];
 #define MEMPOOL_CACHE_SIZE 512
 #define DEMU_SEND_BUFFER_SIZE_PKTS 512
 
-struct rte_ring *rx_to_workers;
-struct rte_ring *rx_to_workers2;
-struct rte_ring *workers_to_tx;
-struct rte_ring *workers_to_tx2;
 
-static uint64_t delayed_time = 0; 
+struct port_t {
+	uint8_t portid;
+	struct rte_ring *rx_to_workers;
+	struct rte_ring *workers_to_tx;
+	struct rte_ring *workers_to_tx_other;
+};
+
+
+enum thread_type_t {
+	RX = 0,
+	TX,
+	WORKER
+};
+
+struct port_t ports[RTE_MAX_ETHPORTS];
+uint8_t nb_lcores;
+uint8_t nb_ports;
+
+static uint64_t delayed_time = 0;
 
 enum demu_loss_mode {
 	LOSS_MODE_NONE,
@@ -288,10 +291,9 @@ demu_timer_loop(void)
 }
 
 static void
-demu_tx_loop(unsigned portid)
+demu_tx_loop(struct port_t port)
 {
 	struct rte_mbuf *send_buf[PKT_BURST_TX];
-	struct rte_ring **cring;
 	unsigned lcore_id;
 	uint32_t numdeq = 0;
 	uint16_t sent;
@@ -301,19 +303,16 @@ demu_tx_loop(unsigned portid)
 
 	lcore_id = rte_lcore_id();
 
+	RTE_LOG(INFO, DEMU, "Entering main tx loop on lcore %u portid %u\n", lcore_id, port.portid);
+
 	while (!force_quit) {
-		if (portid == 0)
-			cring = &workers_to_tx;
-		else
-			cring = &workers_to_tx2;
-		
-		numdeq = rte_ring_sc_dequeue_burst(*cring,
+		numdeq = rte_ring_sc_dequeue_burst(port.workers_to_tx,
 				(void *)(send_buf + prevent_discard), PKT_BURST_TX, NULL);
 
 		if (unlikely(numdeq == 0))
 			continue;
 
-		if (limit_speed && lcore_id == TX_THREAD_CORE) {
+		if (limit_speed) {
 			num_send = 0;
 			for (uint32_t j = 0; j < numdeq + prevent_discard; j++) {
 				pkt_size_bit = send_buf[j]->pkt_len * 8;
@@ -323,15 +322,15 @@ demu_tx_loop(unsigned portid)
 				} else break;
 			}
 			rte_prefetch0(rte_pktmbuf_mtod(send_buf[0], void *));
-			sent = rte_eth_tx_burst(portid, 0, send_buf, num_send);
-			
+			sent = rte_eth_tx_burst(port.portid, 0, send_buf, num_send);
+
 			if (prevent_discard < PKT_BURST_TX) {
 				prevent_discard = numdeq + prevent_discard - num_send;
 			}
 		} else {
 			rte_prefetch0(rte_pktmbuf_mtod(send_buf[0], void *));
-			sent = rte_eth_tx_burst(portid, 0, send_buf, numdeq);
-		}	
+			sent = rte_eth_tx_burst(port.portid, 0, send_buf, numdeq);
+		}
 
 #ifdef DEBUG_TX
 		if (tx_cnt < TX_STAT_BUF_SIZE) {
@@ -341,28 +340,28 @@ demu_tx_loop(unsigned portid)
 			}
 		}
 #endif
-		if (limit_speed && lcore_id == TX_THREAD_CORE) {
+		if (limit_speed) {
 			if (prevent_discard >= (uint16_t)(PKT_BURST_TX * 0.8)) {
 				pktmbuf_free_bulk(&send_buf[sent], numdeq - sent);
 				prevent_discard = 0;
 			}
 		} else {
-			if (unlikely(numdeq != sent)) {	
+			if (unlikely(numdeq != sent)) {
 				pktmbuf_free_bulk(&send_buf[sent], numdeq - sent);
 			}
 		}
 #ifdef DEBUG
 		else {
 			// printf("tx:%u %u\n", numdeq, sent);
-			port_statistics[portid].tx += sent;
-			port_statistics[portid].dropped += (numdeq - sent);
+			port_statistics[port.portid].tx += sent;
+			port_statistics[port.portid].dropped += (numdeq - sent);
 		}
 #endif
 	}
 }
 
 static void
-demu_rx_loop(unsigned portid)
+demu_rx_loop(struct port_t port)
 {
 	struct rte_mbuf *pkts_burst[PKT_BURST_RX], *rx2w_buffer[PKT_BURST_RX];
 	unsigned lcore_id;
@@ -374,25 +373,25 @@ demu_rx_loop(unsigned portid)
 
 	lcore_id = rte_lcore_id();
 
-	RTE_LOG(INFO, DEMU, "Entering main rx loop on lcore %u portid %u\n", lcore_id, portid);
+	RTE_LOG(INFO, DEMU, "Entering main rx loop on lcore %u portid %u\n", lcore_id, port.portid);
 
 	while (!force_quit) {
-		nb_rx = rte_eth_rx_burst((uint8_t) portid, 0,
+		nb_rx = rte_eth_rx_burst((uint8_t) port.portid, 0,
 				pkts_burst, PKT_BURST_RX);
 
 		if (likely(nb_rx == 0))
 			continue;
 
 #ifdef DEBUG
-		port_statistics[portid].rx += nb_rx;
+		port_statistics[port.portid].rx += nb_rx;
 #endif
 		nb_loss = 0;
 		nb_dup = 0;
 		for (i = 0; i < nb_rx; i++) {
 			struct rte_mbuf *clone;
 
-			if (portid == 0 && loss_event()) {
-				port_statistics[portid].discarded++;
+			if (loss_event()) {
+				port_statistics[port.portid].discarded++;
 				nb_loss++;
 				continue;
 			}
@@ -402,7 +401,7 @@ demu_rx_loop(unsigned portid)
 			rx2w_buffer[i - nb_loss + nb_dup]->udata64 = rte_rdtsc();
 
 			/* FIXME: we do not check the buffer overrun of rx2w_buffer. */
-			if (portid == 0 && dup_event()) {
+			if (dup_event()) {
 				clone = rte_pktmbuf_clone(rx2w_buffer[i - nb_loss + nb_dup], demu_pktmbuf_pool);
 				if (clone == NULL)
 					RTE_LOG(ERR, DEMU, "cannot clone a packet\n");
@@ -416,22 +415,17 @@ demu_rx_loop(unsigned portid)
 				rx_cnt++;
 			}
 #endif
-
 		}
 
-		if (portid == 0)
-			numenq = rte_ring_sp_enqueue_burst(rx_to_workers,
-					(void *)rx2w_buffer, nb_rx - nb_loss + nb_dup, NULL);
-		else
-			numenq = rte_ring_sp_enqueue_burst(rx_to_workers2,
+		numenq = rte_ring_sp_enqueue_burst(port.rx_to_workers,
 					(void *)rx2w_buffer, nb_rx - nb_loss + nb_dup, NULL);
 
 
 		if (unlikely(numenq < (unsigned)(nb_rx - nb_loss + nb_dup))) {
 #ifdef DEBUG
-			port_statistics[portid].rx_worker_dropped += (nb_rx - nb_loss + nb_dup - numenq);
+			port_statistics[port.portid].rx_worker_dropped += (nb_rx - nb_loss + nb_dup - numenq);
 			printf("Delayed Queue Overflow count:%" PRIu64 "\n",
-					port_statistics[portid].queue_dropped);
+					port_statistics[port.portid].queue_dropped);
 #endif
 			pktmbuf_free_bulk(&pkts_burst[numenq], nb_rx - nb_loss + nb_dup - numenq);
 		}
@@ -439,7 +433,7 @@ demu_rx_loop(unsigned portid)
 }
 
 static void
-worker_thread(unsigned portid)
+worker_thread(struct port_t port)
 {
 	uint16_t burst_size = 0;
 	struct rte_mbuf *burst_buffer[PKT_BURST_WORKER];
@@ -452,11 +446,7 @@ worker_thread(unsigned portid)
 	i = 0;
 
 	while (!force_quit) {
-		if (portid == 0)
-			burst_size = rte_ring_sc_dequeue_burst(rx_to_workers,
-					(void *)burst_buffer, PKT_BURST_WORKER, NULL);
-		else
-			burst_size = rte_ring_sc_dequeue_burst(rx_to_workers2,
+			burst_size = rte_ring_sc_dequeue_burst(port.rx_to_workers,
 					(void *)burst_buffer, PKT_BURST_WORKER, NULL);
 		if (unlikely(burst_size == 0))
 			continue;
@@ -464,19 +454,10 @@ worker_thread(unsigned portid)
 		i = 0;
 		while (i != burst_size) {
 			diff_tsc = rte_rdtsc() - burst_buffer[i]->udata64;
-
-			/* Add a given delay when a packet comes from the port 0.
-			 * FIXME: fix this implementation.
-			 */
-			if (portid == 0) {
-				if (diff_tsc >= delayed_time) {
-					rte_prefetch0(rte_pktmbuf_mtod(burst_buffer[i], void *));
-					rte_ring_sp_enqueue(workers_to_tx2, burst_buffer[i]);
-					i++;
-				}
-			} else {
-				rte_ring_sp_enqueue(workers_to_tx, burst_buffer[i]);
-				i++; 
+			if (diff_tsc >= delayed_time) {
+				rte_prefetch0(rte_pktmbuf_mtod(burst_buffer[i], void *));
+				rte_ring_sp_enqueue(port.workers_to_tx_other, burst_buffer[i]);
+				i++;
 			}
 		}
 	}
@@ -485,29 +466,30 @@ worker_thread(unsigned portid)
 static int
 demu_launch_one_lcore(__attribute__((unused)) void *dummy)
 {
-	unsigned lcore_id;
+	unsigned lcore_id, lcore_idx;
 	lcore_id = rte_lcore_id();
+	lcore_idx = rte_lcore_index(lcore_id);
 
-	if (lcore_id == TX_THREAD_CORE) 
-		demu_tx_loop(1);
+	/* each port uses 3 lcores */
+	uint8_t port_idx = lcore_idx/3;
+	enum thread_type_t thread_type = lcore_idx%3;
 
-	else if (lcore_id == TX_THREAD_CORE2)
-		demu_tx_loop(0);
+	/* last lcore is for timer_loop */
+	if (lcore_idx + 1 == nb_lcores) {
+		if (limit_speed) demu_timer_loop();
+	}
 
-	else if (lcore_id == WORKER_THREAD_CORE)
-		worker_thread(0);
+	else if (thread_type == RX) {
+		demu_tx_loop(ports[port_idx]);
+	}
 
-	else if (lcore_id == WORKER_THREAD_CORE2)
-		worker_thread(1);	
+	else if (thread_type == TX) {
+		worker_thread(ports[port_idx]);
+	}
 
-	else if (lcore_id == RX_THREAD_CORE)
-		demu_rx_loop(1);
-
-	else if (lcore_id == RX_THREAD_CORE2)
-		demu_rx_loop(0);
-
-	else if (limit_speed && lcore_id == TIMER_THREAD_CORE)
-		demu_timer_loop();
+	else if (thread_type == WORKER) {
+		demu_rx_loop(ports[port_idx]);
+	}
 
 	if (force_quit)
 		return 0;
@@ -519,7 +501,10 @@ demu_launch_one_lcore(__attribute__((unused)) void *dummy)
 static void
 demu_usage(const char *prgname)
 {
-	printf("%s [EAL options] -- -d Delayed time [us] (default is 0s)\n"
+	printf("%s [EAL options] -- "
+		" -P (portid,portid)[,(portid,portid)]: link to add effect.\n"
+		"                                       required argument.\n"
+		" -d Delayed time [us] (default is 0s)\n"
 		" -p PORTMASK: HEXADECIMAL bitmask of ports to configure\n"
 		" -r random packet loss %% (default is 0%%)\n"
 		" -g XXX\n"
@@ -554,6 +539,59 @@ demu_parse_delayed(const char *q_arg)
 		return -1;
 
 	return n;
+}
+
+static int
+demu_parse_port_pairs(const char *q_arg)
+{
+	char s[256];
+	const char *p, *p0 = q_arg;
+	char *end;
+	enum fieldnames {
+		FLD_PORT = 0,
+		FLD_PORT_OTHER,
+		_NUM_FLD
+	};
+	unsigned long int_fld[_NUM_FLD];
+	char *str_fld[_NUM_FLD];
+	int i;
+	unsigned size;
+
+	nb_ports = 0;
+
+	while ((p = strchr(p0,'(')) != NULL) {
+		++p;
+		if((p0 = strchr(p,')')) == NULL)
+			return -1;
+
+		size = p0 - p;
+		if(size >= sizeof(s))
+			return -1;
+
+		snprintf(s, sizeof(s), "%.*s", size, p);
+		if (rte_strsplit(s, sizeof(s), str_fld, _NUM_FLD, ',') != _NUM_FLD)
+			return -1;
+
+		for (i = 0; i < _NUM_FLD; i++){
+			errno = 0;
+			int_fld[i] = strtoul(str_fld[i], &end, 0);
+			if (errno != 0 || end == str_fld[i] || int_fld[i] > 255)
+				return -1;
+		}
+
+		if (nb_ports > RTE_MAX_ETHPORTS) {
+			printf("exceeded max number of ports: %hu\n",
+				nb_ports);
+			return -1;
+		}
+
+		ports[nb_ports].portid = (uint8_t)int_fld[FLD_PORT];
+		++nb_ports;
+		ports[nb_ports].portid = (uint8_t)int_fld[FLD_PORT_OTHER];
+		++nb_ports;
+	}
+
+	return 0;
 }
 
 static int64_t
@@ -612,7 +650,7 @@ demu_parse_args(int argc, char **argv)
 
 	argvopt = argv;
 
-	while ((opt = getopt_long(argc, argvopt, "d:g:p:r:s:D:",
+	while ((opt = getopt_long(argc, argvopt, "d:g:p:P:r:s:D:",
 					longopts, &longindex)) != EOF) {
 
 		switch (opt) {
@@ -621,6 +659,15 @@ demu_parse_args(int argc, char **argv)
 				demu_enabled_port_mask = demu_parse_portmask(optarg);
 				if (demu_enabled_port_mask <= 0) {
 					printf("Invalid value: portmask\n");
+					demu_usage(prgname);
+					return -1;
+				}
+				break;
+
+			case 'P':
+				val = demu_parse_port_pairs(optarg);
+				if (val < 0) {
+					printf("Invalid value: port pairs \n");
 					demu_usage(prgname);
 					return -1;
 				}
@@ -690,6 +737,11 @@ demu_parse_args(int argc, char **argv)
 				demu_usage(prgname);
 				return -1;
 		}
+	}
+
+	if (nb_ports == 0) {
+		RTE_LOG(ERR, DEMU, "Option -P must be specified\n");
+		return -1;
 	}
 
 	if (optind >= 0)
@@ -766,8 +818,6 @@ int
 main(int argc, char **argv)
 {
 	int ret;
-	uint8_t nb_ports;
-	uint8_t portid;
 	unsigned lcore_id;
 
 	/* init EAL */
@@ -786,6 +836,13 @@ main(int argc, char **argv)
 	if (ret < 0)
 		rte_exit(EXIT_FAILURE, "Invalid DEMU arguments\n");
 
+	nb_lcores = rte_lcore_count();
+	uint8_t nb_lcores_required = nb_ports*3 + 1;
+	if (nb_lcores != nb_lcores_required)
+		rte_exit(EXIT_FAILURE, " %d lcores, %d ports.\n"
+				"The number of lcores should be %d (1 + 3*NUMBER_OF_PORTS).\n",
+				nb_lcores, nb_ports, nb_lcores_required);
+
 	/* create the mbuf pool */
 	demu_pktmbuf_pool = rte_pktmbuf_pool_create("mbuf_pool",
 			DEMU_DELAYED_BUFFER_PKTS + DEMU_DELAYED_BUFFER_PKTS + DEMU_SEND_BUFFER_SIZE_PKTS + DEMU_SEND_BUFFER_SIZE_PKTS,
@@ -795,16 +852,11 @@ main(int argc, char **argv)
 	if (demu_pktmbuf_pool == NULL)
 		rte_exit(EXIT_FAILURE, "Cannot init mbuf pool\n");
 
-	nb_ports = rte_eth_dev_count();
-	if (nb_ports == 0)
-		rte_exit(EXIT_FAILURE, "No Ethernet ports - bye\n");
-
-	if (nb_ports > RTE_MAX_ETHPORTS)
-		nb_ports = RTE_MAX_ETHPORTS;
-
 	/* Initialise each port */
-	for (portid = 0; portid < nb_ports; portid++) {
+	for (int i = 0; i < nb_ports; i++) {
 		/* init port */
+		uint8_t portid = ports[i].portid;
+
 		RTE_LOG(INFO, DEMU, "Initializing port %u\n", (unsigned) portid);
 		ret = rte_eth_dev_configure(portid, 1, 1, &port_conf);
 		if (ret < 0)
@@ -850,34 +902,29 @@ main(int argc, char **argv)
 		/* initialize port stats */
 		memset(&port_statistics, 0, sizeof(port_statistics));
 
-	}	
+	}
 
 	check_all_ports_link_status(nb_ports, demu_enabled_port_mask);
 
-
-
-	rx_to_workers = rte_ring_create("rx_to_workers", DEMU_DELAYED_BUFFER_PKTS,
-			rte_socket_id(),   RING_F_SP_ENQ | RING_F_SC_DEQ);
-	if (rx_to_workers == NULL)
-		rte_exit(EXIT_FAILURE, "%s\n", rte_strerror(rte_errno));
-
-	workers_to_tx = rte_ring_create("workers_to_tx", DEMU_SEND_BUFFER_SIZE_PKTS,
+	char ring_name[20];
+	for (int i = 0; i < nb_ports; i++) {
+		sprintf(ring_name, "rx_to_workers_%d", i);
+		ports[i].rx_to_workers = rte_ring_create(ring_name, DEMU_DELAYED_BUFFER_PKTS,
 			rte_socket_id(), RING_F_SP_ENQ | RING_F_SC_DEQ);
-	if (workers_to_tx == NULL)
-		rte_exit(EXIT_FAILURE, "%s\n", rte_strerror(rte_errno));
+		if (ports[i].rx_to_workers == NULL)
+			rte_exit(EXIT_FAILURE, "%s\n", rte_strerror(rte_errno));
 
-	rx_to_workers2 = rte_ring_create("rx_to_workers2", DEMU_DELAYED_BUFFER_PKTS,
-			rte_socket_id(),   RING_F_SP_ENQ | RING_F_SC_DEQ);
+		sprintf(ring_name, "workers_to_tx_%d", i);
+		ports[i].workers_to_tx = rte_ring_create(ring_name, DEMU_SEND_BUFFER_SIZE_PKTS,
+				rte_socket_id(), RING_F_SP_ENQ | RING_F_SC_DEQ);
+		if (ports[i].workers_to_tx == NULL)
+			rte_exit(EXIT_FAILURE, "%s\n", rte_strerror(rte_errno));
+	}
 
-	if (rx_to_workers2 == NULL)
-		rte_exit(EXIT_FAILURE, "%s\n", rte_strerror(rte_errno));
-
-	workers_to_tx2 = rte_ring_create("workers_to_tx2", DEMU_SEND_BUFFER_SIZE_PKTS,
-			rte_socket_id(), RING_F_SP_ENQ | RING_F_SC_DEQ);
-	if (workers_to_tx2 == NULL)
-		rte_exit(EXIT_FAILURE, "%s\n", rte_strerror(rte_errno));
-
-
+	for (int i = 0; i < nb_ports; i += 2) {
+		ports[i+1].workers_to_tx_other = ports[i].workers_to_tx;
+		ports[i].workers_to_tx_other = ports[i+1].workers_to_tx;
+	}
 
 	ret = 0;
 	/* launch per-lcore init on every lcore */
@@ -889,9 +936,10 @@ main(int argc, char **argv)
 		}
 	}
 
-	for (portid = 0; portid < nb_ports; portid++) {
+	for (int i = 0; i < nb_ports; i++) {
+		uint8_t portid = ports[i].portid;
 		/* if ((demu_enabled_port_mask & (1 << portid)) == 0) */
-		/* 	continue; */
+		/*  continue; */
 		RTE_LOG(INFO, DEMU, "Closing port %d\n", portid);
 		rte_eth_dev_stop(portid);
 		rte_eth_dev_close(portid);
@@ -931,7 +979,7 @@ main(int argc, char **argv)
 	fclose(rxoutput);
 #endif
 #ifdef DEBUG_TX
-	char filename2[64] = {'\0'}; 
+	char filename2[64] = {'\0'};
 	strftime(filename2, 64, "/home/aketa/result/txtime%m%d%H%M%S", timeptr);
 	FILE *txoutput;
 	if ((txoutput = fopen(filename2, "a+")) == NULL) {
@@ -1033,7 +1081,7 @@ loss_event_GE(uint64_t loss_rate_n, uint64_t loss_rate_a, uint64_t st_ch_rate_no
 {
 #define S_NOR 0
 #define S_ABN 1
-	static bool state = S_NOR; 
+	static bool state = S_NOR;
 	uint64_t rnd_loss, rnd_tran;
 	uint64_t loss_rate, state_ch_rate;
 	bool flag = false;
@@ -1071,7 +1119,7 @@ loss_event_GE(uint64_t loss_rate_n, uint64_t loss_rate_a, uint64_t st_ch_rate_no
 static bool
 loss_event_4state( uint64_t p13, uint64_t p14, uint64_t p23, uint64_t p31, uint64_t p32)
 {
-	static char state = 1; 
+	static char state = 1;
 	bool flag = false;
 	uint64_t rnd = rte_rand() % (RANDOM_MAX + 1);
 
@@ -1089,7 +1137,7 @@ loss_event_4state( uint64_t p13, uint64_t p14, uint64_t p23, uint64_t p31, uint6
 			state = 3;
 		}
 		break;
- 
+
 	case 3:
 		if (rnd < p31) {
 			state = 1;
@@ -1097,7 +1145,7 @@ loss_event_4state( uint64_t p13, uint64_t p14, uint64_t p23, uint64_t p31, uint6
 			state = 2;
 		}
 		break;
- 
+
 	case 4:
 		state = 1;
 		break;

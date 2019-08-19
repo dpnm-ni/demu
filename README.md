@@ -3,7 +3,7 @@
 Copyright (c) 2017-2019 National Institute of Advanced Industrial Science and Technology (AIST), Japan
 
 ## Overview
-DEMU is a software-based network emulator implemented as a DPDK application. Conventional software-based emulator such as NetEm and dummynet have problems on the throughput of packet forwarding and the accuracy of emulation. DEMU addresses this problem by using a high-performance user-land network framework, i.e., DPDK, and it can emulate latencies on the order of 10ms for short-packet traffic at the 10GbE line rate with high accuracy. 
+DEMU is a software-based network emulator implemented as a DPDK application. Conventional software-based emulator such as NetEm and dummynet have problems on the throughput of packet forwarding and the accuracy of emulation. DEMU addresses this problem by using a high-performance user-land network framework, i.e., DPDK, and it can emulate latencies on the order of 10ms for short-packet traffic at the 10GbE line rate with high accuracy.
 
 DEMU is released under the BSD-3-Clause license.
 
@@ -67,7 +67,7 @@ $ make
 
 ### Usage
 
-This figure shows an example configuration, where each box represents PC. DEMU is running on the middle machine which has two network interface cards (e.g., enp1s0f0, enp1s0f1).
+This figure shows an example configuration, where each box represents PC. DEMU is running on the middle machine which has at least two network interface cards (e.g., enp1s0f0, enp1s0f1).
 
 ```
 +--------+     +------------+     +--------+
@@ -126,9 +126,7 @@ Note: PCI device ID (e.g., 0000:01:00.0) depends on the hardware configuration.
 
 ## Known Issues
 
-- **Maximum number of queuing packet**: It is possible to queue up to 4M packets in the buffer. If you want to emulate a large BDP network such as 10GbE with 100ms of latency and transfer short packets over the network, you should enable the macro `SHORT_PACKET` and build the DEMU again. It is only for testing short packet (less than 1000B), so you don't enable this macro for normal emulation situations. 
-- **Fixed port ID**: DEMU assumes a machine has two network interfaces (i.e., ports). Packets incomming from the port ID 0 are forwarded to the port ID 1, and vice versa. This pairing is fixed.
-- **Asymmetric delay setting**: DEMU only support one-way delay emulation.
+- **Maximum number of queuing packet**: It is possible to queue up to 4M packets in the buffer. If you want to emulate a large BDP network such as 10GbE with 100ms of latency and transfer short packets over the network, you should enable the macro `SHORT_PACKET` and build the DEMU again. It is only for testing short packet (less than 1000B), so you don't enable this macro for normal emulation situations.
 
 
 
