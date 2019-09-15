@@ -92,7 +92,7 @@ $ sudo $RTE_SDK/usertools/dpdk-devbind.py --bind=uio_pci_generic enp1s0f1
 Next, you issues demu command with options as follows:
 
 ```shell
-$ sudo ./build/demu -c fc -n 4 -- -p 3 -d <delay time [us]> -r <packet loss rate [%]>
+$ sudo ./build/demu -c fc -n 4 -- -P "(0,1,100)"
 ```
 
 Ctrl+c terminates the DEMU process.
@@ -102,7 +102,7 @@ Ctrl+c terminates the DEMU process.
 For packet loss based on Gilbert-Elliott model,
 
 ```shell
-$ sudo ./build/demu -c fc -n 4 -- -p 3 -d <delay time [us]> \
+$ sudo ./build/demu -c fc -n 4 -- -P "(0,1,0)" \
                                   -r <probability from Good state to Bad state [%]> \
                                   -g <probability from Bad state to Good state [%]>
 ```
@@ -110,7 +110,7 @@ $ sudo ./build/demu -c fc -n 4 -- -p 3 -d <delay time [us]> \
 For bandwidth limtation, you can specify the target rate as `-s <speed>[K|M|G]`. For example, `1G` means 1 Gbps. Note: DEMU assigns one extra core for a timer thread. Therefore you have to change the `--coremap (-c)` option.
 
 ```shell
-$ sudo ./build/demu -c 1fc -n 4 -- -p 3 -s <speed[K/M/G]>
+$ sudo ./build/demu -c 1fc -n 4 -- -P "(0,1,0)" -s <speed[K/M/G]>
 ```
 
 Finally, you restore the normal Linux network configuration as follows:
@@ -121,8 +121,6 @@ $ sudo $RTE_SDK/usertools/dpdk-devbind.py --bind=ixgbe 0000:01:00.1
 ```
 
 Note: PCI device ID (e.g., 0000:01:00.0) depends on the hardware configuration.
-
-
 
 ## Known Issues
 

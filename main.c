@@ -148,6 +148,7 @@ struct demu_port_statistics port_statistics[RTE_MAX_ETHPORTS];
 
 struct port_t {
 	uint8_t portid;
+	uint64_t delayed_time;
 	struct rte_ring *rx_to_workers;
 	struct rte_ring *workers_to_tx;
 	struct rte_ring *workers_to_tx_other;
@@ -163,8 +164,6 @@ enum thread_type_t {
 struct port_t ports[RTE_MAX_ETHPORTS];
 uint8_t nb_lcores;
 uint8_t nb_ports;
-
-static uint64_t delayed_time = 0;
 
 enum demu_loss_mode {
 	LOSS_MODE_NONE,
@@ -454,7 +453,7 @@ worker_thread(struct port_t port)
 		i = 0;
 		while (i != burst_size) {
 			diff_tsc = rte_rdtsc() - burst_buffer[i]->udata64;
-			if (diff_tsc >= delayed_time) {
+			if (diff_tsc >= port.delayed_time) {
 				rte_prefetch0(rte_pktmbuf_mtod(burst_buffer[i], void *));
 				rte_ring_sp_enqueue(port.workers_to_tx_other, burst_buffer[i]);
 				i++;
@@ -502,9 +501,8 @@ static void
 demu_usage(const char *prgname)
 {
 	printf("%s [EAL options] -- "
-		" -P (portid,portid)[,(portid,portid)]: link to add effect.\n"
+		" -P (portid,portid,delayed_us)[,(portid,portid,delayed_us)]: link to add effect.\n"
 		"                                       required argument.\n"
-		" -d Delayed time [us] (default is 0s)\n"
 		" -p PORTMASK: HEXADECIMAL bitmask of ports to configure\n"
 		" -r random packet loss %% (default is 0%%)\n"
 		" -g XXX\n"
@@ -528,20 +526,6 @@ demu_parse_portmask(const char *portmask)
 }
 
 static int
-demu_parse_delayed(const char *q_arg)
-{
-	char *end = NULL;
-	int n;
-
-	/* parse number string */
-	n = strtol(q_arg, &end, 10);
-	if ((q_arg[0] == '\0') || (end == NULL) || (*end != '\0'))
-		return -1;
-
-	return n;
-}
-
-static int
 demu_parse_port_pairs(const char *q_arg)
 {
 	char s[256];
@@ -550,6 +534,7 @@ demu_parse_port_pairs(const char *q_arg)
 	enum fieldnames {
 		FLD_PORT = 0,
 		FLD_PORT_OTHER,
+		FLD_DELAYED_TIME,
 		_NUM_FLD
 	};
 	unsigned long int_fld[_NUM_FLD];
@@ -575,7 +560,7 @@ demu_parse_port_pairs(const char *q_arg)
 		for (i = 0; i < _NUM_FLD; i++){
 			errno = 0;
 			int_fld[i] = strtoul(str_fld[i], &end, 0);
-			if (errno != 0 || end == str_fld[i] || int_fld[i] > 255)
+			if (end == str_fld[i])
 				return -1;
 		}
 
@@ -585,9 +570,16 @@ demu_parse_port_pairs(const char *q_arg)
 			return -1;
 		}
 
+		uint64_t delayed_time = \
+			((rte_get_tsc_hz() + US_PER_S - 1) / US_PER_S) * \
+			int_fld[FLD_DELAYED_TIME];
+
 		ports[nb_ports].portid = (uint8_t)int_fld[FLD_PORT];
+		ports[nb_ports].delayed_time = delayed_time;
 		++nb_ports;
+
 		ports[nb_ports].portid = (uint8_t)int_fld[FLD_PORT_OTHER];
+		ports[nb_ports].delayed_time = delayed_time;
 		++nb_ports;
 	}
 
@@ -650,7 +642,7 @@ demu_parse_args(int argc, char **argv)
 
 	argvopt = argv;
 
-	while ((opt = getopt_long(argc, argvopt, "d:g:p:P:r:s:D:",
+	while ((opt = getopt_long(argc, argvopt, "g:p:P:r:s:D:h:",
 					longopts, &longindex)) != EOF) {
 
 		switch (opt) {
@@ -671,17 +663,6 @@ demu_parse_args(int argc, char **argv)
 					demu_usage(prgname);
 					return -1;
 				}
-				break;
-
-			/* delayed packet */
-			case 'd':
-				val = demu_parse_delayed(optarg);
-				if (val < 0) {
-					printf("Invalid value: delayed time\n");
-					demu_usage(prgname);
-					return -1;
-				}
-				delayed_time = (rte_get_tsc_hz() + US_PER_S - 1) / US_PER_S * val;
 				break;
 
 			/* random packet loss */
