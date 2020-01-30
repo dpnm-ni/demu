@@ -328,7 +328,9 @@ demu_tx_loop(struct port_t port)
 			}
 		} else {
 			rte_prefetch0(rte_pktmbuf_mtod(send_buf[0], void *));
-			sent = rte_eth_tx_burst(port.portid, 0, send_buf, numdeq);
+			sent = 0;
+			while (numdeq > sent)
+				sent += rte_eth_tx_burst(port.portid, 0, send_buf + sent, numdeq - sent);
 		}
 
 #ifdef DEBUG_TX
@@ -343,10 +345,6 @@ demu_tx_loop(struct port_t port)
 			if (prevent_discard >= (uint16_t)(PKT_BURST_TX * 0.8)) {
 				pktmbuf_free_bulk(&send_buf[sent], numdeq - sent);
 				prevent_discard = 0;
-			}
-		} else {
-			if (unlikely(numdeq != sent)) {
-				pktmbuf_free_bulk(&send_buf[sent], numdeq - sent);
 			}
 		}
 #ifdef DEBUG
